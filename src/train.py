@@ -8,7 +8,21 @@ import numpy as np
 import cv2
 from models import ResNet50UpProj
 from utils import visualize_depth_map
-from engine import train_depth_model
+import torch
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+
+import mlflow
+import mlflow.pytorch
+
+mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_experiment("MyExperiment")
+mlflow.pytorch.autolog()
+
 
 # Set the working directory to the script's directory
 path = Path(__file__).parent
@@ -93,5 +107,119 @@ model = ResNet50UpProj(num_classes=1)
 out = model(xb)
 print(f"Model output shape: {out.shape}")
 
+# trainer
+import matplotlib.pyplot as plt
+
+import matplotlib.pyplot as plt
+
+def train_depth_model(
+    model,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    epochs: int = 10,
+    lr: float = 1e-4,
+    save_path: str = "resnet_uproj_depth.pt",
+    device: torch.device = None,
+):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    mlflow.log_param("epochs", epochs)
+    mlflow.log_param("learning_rate", lr)
+    mlflow.log_param("optimizer", "Adam")
+    mlflow.log_param("loss_fn", "MSELoss")
+    mlflow.log_param("batch_size", train_loader.batch_size)
+
+    best_val_loss = float("inf")
+    train_losses = []
+    val_losses = []
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+
+        for images, depths in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} - Training"):
+            images = images.to(device)
+            depths = depths.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+
+            if outputs.shape != depths.shape:
+                outputs = torch.nn.functional.interpolate(
+                    outputs, size=depths.shape[-2:], mode='bilinear', align_corners=False
+                )
+
+            loss = criterion(outputs, depths)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * images.size(0)
+
+        train_loss /= len(train_loader.dataset)
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, depths in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} - Validation"):
+                images = images.to(device)
+                depths = depths.to(device)
+
+                outputs = model(images)
+                if outputs.shape != depths.shape:
+                    outputs = torch.nn.functional.interpolate(
+                        outputs, size=depths.shape[-2:], mode='bilinear', align_corners=False
+                    )
+
+                loss = criterion(outputs, depths)
+                val_loss += loss.item() * images.size(0)
+
+        val_loss /= len(val_loader.dataset)
+
+        # Log metrics
+        mlflow.log_metric("train_loss", train_loss, step=epoch)
+        mlflow.log_metric("val_loss", val_loss, step=epoch)
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), save_path)
+            mlflow.log_artifact(save_path)
+            print(f"✅ Model saved to {save_path} (best val loss: {best_val_loss:.4f})")
+
+    # Final model logging
+    mlflow.pytorch.log_model(model, artifact_path="final_model")
+
+    # Log final loss plot
+    fig, ax = plt.subplots()
+    ax.plot(train_losses, label="Train Loss")
+    ax.plot(val_losses, label="Val Loss")
+    ax.set_title("Loss over Epochs")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.legend()
+    fig_path = "loss_curve.png"
+    fig.savefig(fig_path)
+    plt.close(fig)
+    mlflow.log_artifact(fig_path)
+
+    # Log a batch of predictions vs. ground truth
+    images, depths = next(iter(val_loader))
+    fig = visualize_depth_map((images[:6], depths[:6]), test=True, model=model)
+    fig_pred_path = "sample_predictions.png"
+    fig.savefig(fig_pred_path)
+    plt.close(fig)
+    mlflow.log_artifact(fig_pred_path)
+
+
 # Train the model
-train_depth_model(model, train_loader, val_loader, epochs=30)
+with mlflow.start_run():
+    train_depth_model(model, train_loader, val_loader, epochs=20)

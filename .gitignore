@@ -2,3 +2,5 @@
 *.pyc
 data/
 val_extracted/
+*.pyc
+*.db
