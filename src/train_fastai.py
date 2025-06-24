@@ -5,14 +5,14 @@ import cv2
 import torch
 from sklearn.model_selection import train_test_split
 from fastai.callback.wandb import *
-import wandb
 import mlflow
-
-wandb.login(key="97b5307e24cc3a77259ade3057e4eea6fd2addb0")
-wandb.init(project="depth-estimation", name="depth_estimation_experiment")
+from fastai.callback.core import Callback
 
 import mlflow
 from fastai.callback.core import Callback
+
+mlflow.set_tracking_uri("http://192.168.95.103:5000")
+mlflow.set_experiment("depth_prediction_experiment_fastai_mlflow")
 
 class MLflowCallback(Callback):
     "Minimal MLflow integration for fastai"
@@ -315,9 +315,9 @@ learn = Learner(
     loss_func=loss_func,
     opt_func=Adam,
     metrics=[mae, rmse],
-    cbs=[WandbCallback(log_preds=True, log_model=True)])
+    cbs=[MLflowCallback()])
 
-learn.fit_one_cycle(3, 1e-4)
+learn.fit_one_cycle(20, 1e-4)
 
 def visualize_depth_map(samples, test=False, model=None):
     input, target = samples
