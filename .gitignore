@@ -1,0 +1,4 @@
+.env
+*.pyc
+data/
+val_extracted/
