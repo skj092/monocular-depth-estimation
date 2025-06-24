@@ -4,3 +4,5 @@ data/
 val_extracted/
 *.pyc
 *.db
+mlruns/
+mlartifacts/

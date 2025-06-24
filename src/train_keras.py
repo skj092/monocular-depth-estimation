@@ -12,6 +12,11 @@ import pandas as pd
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+import mlflow
+mlflow.set_tracking_uri("http://192.168.95.103:5000/")  # or use your custom tracking server
+mlflow.set_experiment("DepthEstimation-Keras")
+
+mlflow.tensorflow.autolog()
 
 keras.utils.set_random_seed(123)
 
@@ -35,7 +40,7 @@ df = df.sample(frac=1, random_state=42)
 
 HEIGHT = 256
 WIDTH = 256
-LR = 0.00001
+LR = 0.0001
 EPOCHS = 30
 BATCH_SIZE = 32
 
@@ -117,24 +122,42 @@ class DataGenerator(keras.utils.PyDataset):
         return x, y
 
 
-def visualize_depth_map(samples, test=False, model=None):
+def visualize_depth_map(samples, test=False, model=None, mlflow_log_path=None):
     input, target = samples
     cmap = plt.cm.jet
     cmap.set_bad(color="black")
 
     if test:
         pred = model.predict(input)
-        fig, ax = plt.subplots(6, 3, figsize=(50, 50))
+        fig, ax = plt.subplots(6, 3, figsize=(18, 36))
         for i in range(6):
             ax[i, 0].imshow((input[i].squeeze()))
-            ax[i, 1].imshow((target[i].squeeze()), cmap=cmap)
-            ax[i, 2].imshow((pred[i].squeeze()), cmap=cmap)
+            ax[i, 0].set_title("Input")
 
+            ax[i, 1].imshow((target[i].squeeze()), cmap=cmap)
+            ax[i, 1].set_title("Ground Truth")
+
+            ax[i, 2].imshow((pred[i].squeeze()), cmap=cmap)
+            ax[i, 2].set_title("Prediction")
     else:
-        fig, ax = plt.subplots(6, 2, figsize=(50, 50))
+        fig, ax = plt.subplots(6, 2, figsize=(12, 36))
         for i in range(6):
             ax[i, 0].imshow((input[i].squeeze()))
+            ax[i, 0].set_title("Input")
+
             ax[i, 1].imshow((target[i].squeeze()), cmap=cmap)
+            ax[i, 1].set_title("Ground Truth")
+
+    plt.tight_layout()
+
+    # Save and log to MLflow if path is provided
+    if mlflow_log_path:
+        save_path = os.path.join(mlflow_log_path, "depth_map_comparison.png")
+        fig.savefig(save_path)
+        plt.close(fig)
+        mlflow.log_artifact(save_path)
+    else:
+        plt.show()
 
 
 visualize_samples = next(
@@ -354,26 +377,30 @@ train_loader = DataGenerator(
 validation_loader = DataGenerator(
     data=df[260:].reset_index(drop="true"), batch_size=BATCH_SIZE, dim=(HEIGHT, WIDTH)
 )
-model.fit(
-    train_loader,
-    epochs=EPOCHS,
-    validation_data=validation_loader,
-)
 
-test_loader = next(
-    iter(
-        DataGenerator(
-            data=df[265:].reset_index(drop="true"), batch_size=6, dim=(HEIGHT, WIDTH)
+with mlflow.start_run():
+    model.fit(
+        train_loader,
+        epochs=EPOCHS,
+        validation_data=validation_loader,
+    )
+
+    # Visualize and log output
+    os.makedirs("mlflow_outputs", exist_ok=True)
+    test_loader = next(
+        iter(
+            DataGenerator(
+                data=df[265:].reset_index(drop="true"), batch_size=6, dim=(HEIGHT, WIDTH)
+            )
         )
     )
-)
-visualize_depth_map(test_loader, test=True, model=model)
+    visualize_depth_map(test_loader, test=True, model=model, mlflow_log_path="mlflow_outputs")
 
-test_loader = next(
-    iter(
-        DataGenerator(
-            data=df[300:].reset_index(drop="true"), batch_size=6, dim=(HEIGHT, WIDTH)
+    test_loader = next(
+        iter(
+            DataGenerator(
+                data=df[300:].reset_index(drop="true"), batch_size=6, dim=(HEIGHT, WIDTH)
+            )
         )
     )
-)
-visualize_depth_map(test_loader, test=True, model=model)
+
