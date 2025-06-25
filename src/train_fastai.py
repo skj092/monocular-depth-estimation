@@ -2,59 +2,33 @@ from fastai.vision.all import *
 import pandas as pd
 import numpy as np
 import cv2
+import matplotlib.pyplot as plt
+import os
+from pathlib import Path
 import torch
-from fastai.callback.wandb import *
-import mlflow
-from fastai.callback.core import Callback
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-
 import mlflow
-from fastai.callback.core import Callback
+from datetime import datetime
+from tqdm import tqdm
 
+# Assume these are defined
+from utils import visualize_depth_map
+from models import ResNet50UpProj
+from loss_fns import calculate_loss
+
+# Setup MLflow
 mlflow.set_tracking_uri("http://192.168.95.103:5000")
 mlflow.set_experiment("depth_prediction_experiment_fastai_mlflow")
+if mlflow.active_run():
+    mlflow.end_run()
 
-class MLflowCallback(Callback):
-    "Minimal MLflow integration for fastai"
-    order = Recorder.order + 1
-
-    def __init__(self, log_model: bool = True, model_name: str = "model"):
-        self.log_model = log_model
-        self.model_name = model_name
-
-    def before_fit(self):
-        if mlflow.active_run() is None:
-            mlflow.start_run()
-        self.run = True
-
-    def after_epoch(self):
-        logs = {'epoch': self.epoch}
-        names = self.recorder.metric_names
-        values = self.recorder.log
-        logs.update({k: v for k, v in zip(names, values) if k not in ('epoch', 'time')})
-        mlflow.log_metrics(logs, step=self.epoch)
-
-    def after_fit(self):
-        if self.log_model:
-            # Save and log model weights
-            fname = f'{self.model_name}.pth'
-            path = self.learn.path / fname
-            torch.save(self.learn.model.state_dict(), path)
-            mlflow.log_artifact(str(path))
-            print(f"Logged model to MLflow: {path}")
-        mlflow.end_run()
-
-
-
-
-# Create a DataFrame with image paths and corresponding depth and mask files
+# Data preparation (training and validation)
 train_path = "train_extracted/train/indoors"
-
 filelist = []
 for root, dirs, files in os.walk(train_path):
     for file in files:
         filelist.append(os.path.join(root, file))
-
 filelist.sort()
 data = {
     "image": [x for x in filelist if x.endswith(".png")],
@@ -63,9 +37,11 @@ data = {
 }
 df = pd.DataFrame(data)
 df = df.sample(frac=0.1, random_state=42).reset_index(drop=True)
-print(f"Total samples: {len(df)}")
+print(f"Total train samples: {len(df)}")
 train_df, valid_df = train_test_split(df, test_size=0.2, random_state=42)
+print(f"Training samples: {len(train_df)}, Validation samples: {len(valid_df)}")
 
+# FastAI data loading
 def open_image(fn):
     img = cv2.imread(fn)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -75,32 +51,23 @@ def open_image(fn):
 def load_depth_masked(row):
     depth = np.load(row['depth']).squeeze()
     mask = np.load(row['mask']) > 0
-
-    # Avoid 0s and negatives before log
-    epsilon = 1e-6  # small value to prevent log(0)
-    max_depth = min(300, np.percentile(depth[mask], 99))  # safer to mask before percentile
+    epsilon = 1e-6
+    max_depth = min(300, np.percentile(depth[mask], 99))
     depth = np.clip(depth, epsilon, max_depth)
-
-    # Apply log only where masked
     depth_log = np.zeros_like(depth)
     depth_log[mask] = np.log(depth[mask])
-
-    # Normalize log depth to 0-255
     depth_log = np.clip(depth_log, np.log(epsilon), np.log(max_depth))
     depth_log = cv2.resize(depth_log, (256, 256))
-
-    # Normalize and handle potential NaNs/Infs
     with np.errstate(invalid='ignore', divide='ignore'):
-        depth_norm = (depth_log / np.log(max_depth)) * 255
+        depth_norm = (depth_log / np.log(max_depth))
         depth_norm = np.nan_to_num(depth_norm, nan=0.0, posinf=0.0, neginf=0.0)
-
-    depth_uint8 = depth_norm.astype(np.uint8)
-
+    depth_uint8 = (depth_norm * 255).astype(np.uint8)
     return PILImageBW.create(depth_uint8)
 
 def get_x(row): return open_image(row['image'])
 def get_y(row): return load_depth_masked(row)
 
+# Training/validation DataLoader (FastAI)
 dblock = DataBlock(
     blocks=(ImageBlock, ImageBlock),
     get_x=get_x,
@@ -110,194 +77,67 @@ dblock = DataBlock(
 )
 dls = dblock.dataloaders(pd.concat([train_df, valid_df]), bs=32, num_workers=4)
 
+# Test dataset (PyTorch)
+print("Preparing test data...")
+test_path = "val_extracted/val/indoors"
+filelist = []
+for root, dirs, files in os.walk(test_path):
+    for file in files:
+        filelist.append(os.path.join(root, file))
+filelist.sort()
+data = {
+    "image": [x for x in filelist if x.endswith(".png")],
+    "depth": [x for x in filelist if x.endswith("_depth.npy")],
+    "mask": [x for x in filelist if x.endswith("_depth_mask.npy")],
+}
+test_df = pd.DataFrame(data)
+print(f"Total test samples: {len(test_df)}")  # Should print 325
+
+class DepthDataset(Dataset):
+    def __init__(self, df):
+        self.df = df
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img = cv2.imread(row['image'])
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (256, 256))
+        img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        depth = np.load(row['depth']).squeeze()
+        mask = np.load(row['mask']) > 0
+        epsilon = 1e-6
+        max_depth = min(300, np.percentile(depth[mask], 99))
+        depth = np.clip(depth, epsilon, max_depth)
+        depth_log = np.zeros_like(depth)
+        depth_log[mask] = np.log(depth[mask])
+        depth_log = np.clip(depth_log, np.log(epsilon), np.log(max_depth))
+        depth_log = cv2.resize(depth_log, (256, 256))
+        with np.errstate(invalid='ignore', divide='ignore'):
+            depth_norm = (depth_log / np.log(max_depth))
+            depth_norm = np.nan_to_num(depth_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        depth_tensor = torch.from_numpy(depth_norm).float().unsqueeze(0)
+        return img, depth_tensor
+
+test_dataset = DepthDataset(test_df)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
+
+# Model and loss function
 class DepthWrapper(nn.Module):
     def __init__(self, base_model):
         super().__init__()
         self.model = base_model
-
-    def forward(self, x):  # FastAI expects output shape = input shape
+    def forward(self, x):
         out = self.model(x)
         return F.interpolate(out, size=(256, 256), mode='bilinear', align_corners=False)
-
-
-# https://github.com/irolaina/FCRN-DepthPrediction/blob/master/tensorflow/models/fcrn.py
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchsummary
-
-
-class Bottleneck(nn.Module):
-    expansion = 4
-    def __init__(self, in_channels, mid_channels, stride=1, downsample=None):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid_channels)
-        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(mid_channels)
-        self.conv3 = nn.Conv2d(mid_channels, mid_channels * self.expansion, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(mid_channels * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-
-    def forward(self, x):
-        identity = x
-        if self.downsample:
-            identity = self.downsample(x)
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.relu(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
-        out += identity
-        out = self.relu(out)
-        return out
-
-class UpProjectionBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1):
-        super().__init__()
-        self.up = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv2d(in_channels, out_channels, kernel_size, padding=1, stride=stride, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        return self.up(x)
-
-class ResNet50UpProj(nn.Module):
-    def __init__(self, num_classes=1):
-        super().__init__()
-        self.in_channels = 64
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1   = nn.BatchNorm2d(64)
-        self.relu  = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-        # Residual layers
-        self.layer1 = self._make_layer(64, 3)
-        self.layer2 = self._make_layer(128, 4, stride=2)
-        self.layer3 = self._make_layer(256, 6, stride=2)
-        self.layer4 = self._make_layer(512, 3, stride=2)
-
-        # Transition
-        self.trans = nn.Sequential(
-            nn.Conv2d(2048, 1024, kernel_size=1, bias=True),
-            nn.BatchNorm2d(1024),
-        )
-
-        # Up-projection layers
-        self.up1 = UpProjectionBlock(1024, 512)
-        self.up2 = UpProjectionBlock(512, 256)
-        self.up3 = UpProjectionBlock(256, 128)
-        self.up4 = UpProjectionBlock(128, 64)
-
-        self.final = nn.Sequential(
-            nn.Dropout(0.0),
-            nn.Conv2d(64, num_classes, kernel_size=3, stride=1, padding=1)
-        )
-
-    def _make_layer(self, mid_channels, blocks, stride=1):
-        downsample = None
-        out_channels = mid_channels * Bottleneck.expansion
-        if stride != 1 or self.in_channels != out_channels:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels),
-            )
-        layers = [Bottleneck(self.in_channels, mid_channels, stride, downsample)]
-        self.in_channels = out_channels
-        for _ in range(1, blocks):
-            layers.append(Bottleneck(self.in_channels, mid_channels))
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.maxpool(x)
-
-        x = self.layer1(x)  # res2
-        x = self.layer2(x)  # res3
-        x = self.layer3(x)  # res4
-        x = self.layer4(x)  # res5
-
-        x = self.trans(x)
-        x = self.up1(x)
-        x = self.up2(x)
-        x = self.up3(x)
-        x = self.up4(x)
-        x = self.final(x)
-        return x
-
-if __name__ == "__main__":
-    model = ResNet50UpProj(num_classes=1)
-    # summary = torchsummary.summary(model, (3, 304, 228), device='cpu')
-    # print(summary)
-    batch = torch.randn(16, 3, 304, 228)
-    output = model(batch)
-    print(f"Output shape: {output.shape}")
-
-import torch
-import torch.nn.functional as F
-from torchvision.models._utils import IntermediateLayerGetter
-
-# Optional: SSIM implementation
-import pytorch_msssim
-
-def image_gradients(image):
-    if image.ndim != 4:
-        raise ValueError(
-            f"image_gradients expects a 4D tensor [B, C, H, W], not {image.shape}."
-        )
-
-    dy = image[:, :, 1:, :] - image[:, :, :-1, :]
-    dx = image[:, :, :, 1:] - image[:, :, :, :-1]
-
-    # Pad to retain original shape
-    dy = F.pad(dy, (0, 0, 0, 1), mode="constant", value=0)
-    dx = F.pad(dx, (0, 1, 0, 0), mode="constant", value=0)
-
-    return dy, dx
-
-def calculate_loss(target, pred, ssim_loss_weight=1.0, l1_loss_weight=1.0, edge_loss_weight=1.0, max_val=1.0):
-    # Image gradients
-    dy_true, dx_true = image_gradients(target)
-    dy_pred, dx_pred = image_gradients(pred)
-
-    weights_x = torch.exp(torch.mean(torch.abs(dx_true)))
-    weights_y = torch.exp(torch.mean(torch.abs(dy_true)))
-
-    # Smoothness loss
-    smoothness_x = dx_pred * weights_x
-    smoothness_y = dy_pred * weights_y
-    depth_smoothness_loss = torch.mean(torch.abs(smoothness_x)) + torch.mean(torch.abs(smoothness_y))
-
-    # SSIM loss (assuming images are in [0, 1] range)
-    ssim_loss = 1 - pytorch_msssim.ssim(pred, target, data_range=max_val, size_average=True)
-
-    # L1 Loss
-    l1_loss = torch.mean(torch.abs(target - pred))
-
-    # Final loss
-    loss = (
-        ssim_loss_weight * ssim_loss
-        + l1_loss_weight * l1_loss
-        + edge_loss_weight * depth_smoothness_loss
-    )
-    return loss
-
-if __name__ == "__main__":
-    # Example usage
-    target = torch.rand(1, 3, 256, 256)  # Random target image
-    pred = torch.rand(1, 3, 256, 256)    # Random predicted image
-
-    loss = calculate_loss(target, pred)
-    print(f"Calculated loss: {loss.item()}")
 
 class CombinedDepthLoss:
     def __init__(self, ssim_loss_weight=1.0, l1_loss_weight=1.0, edge_loss_weight=1.0):
         self.ssim_loss_weight = ssim_loss_weight
         self.l1_loss_weight = l1_loss_weight
         self.edge_loss_weight = edge_loss_weight
-
     def __call__(self, pred, target):
         return calculate_loss(
             target,
@@ -309,80 +149,169 @@ class CombinedDepthLoss:
         )
 
 model = DepthWrapper(ResNet50UpProj(num_classes=1))
+loss_func = CombinedDepthLoss(ssim_loss_weight=1.0, l1_loss_weight=1.0, edge_loss_weight=1.0)
 
-loss_func = CombinedDepthLoss(
-    ssim_loss_weight=1.0,
-    l1_loss_weight=1.0,
-    edge_loss_weight=1.0
-)
+# Metrics
+def abs_rel(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = target > 1e-3  # Stricter threshold to avoid division by near-zero
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.mean(torch.abs(pred[mask] - target[mask]) / target[mask])
 
-from fastai.metrics import mae, rmse
+def log10_mae(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = (target > 1e-3) & (pred > 1e-3)  # Mask non-positive values
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.mean(torch.abs(torch.log10(pred[mask]) - torch.log10(target[mask])))
 
+def log10_rmse(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = (target > 1e-3) & (pred > 1e-3)
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.sqrt(torch.mean((torch.log10(pred[mask]) - torch.log10(target[mask])) ** 2))
+
+def threshold_accuracy(thresh):
+    def _inner(pred, target):
+        pred, target = pred.squeeze(), target.squeeze()
+        mask = target > 1e-3
+        if mask.sum() == 0:
+            return float('nan')
+        ratio = torch.max(pred[mask] / target[mask], target[mask] / pred[mask])
+        return torch.mean((ratio < thresh).float())
+    return _inner
+
+delta1 = threshold_accuracy(1.25)
+delta2 = threshold_accuracy(1.25 ** 2)
+delta3 = threshold_accuracy(1.25 ** 3)
+
+# MLflowCallback
+class MLflowCallback(Callback):
+    def __init__(self, log_model=True, test_loader=None, run_name=None, device='cuda'):
+        super().__init__()
+        self.log_model = log_model
+        self.test_loader = test_loader
+        self.run_name = run_name or f"DepthPrediction_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.artifact_dir = Path("mlflow_artifacts")
+        self.artifact_dir.mkdir(exist_ok=True)
+        self.run = None
+        self.device = device
+
+    def before_fit(self):
+        try:
+            if mlflow.active_run():
+                mlflow.end_run()
+            self.run = mlflow.start_run(run_name=self.run_name)
+            mlflow.log_params({
+                "lr": float(self.learn.opt.hypers[0]["lr"]),
+                "batch_size": int(self.dls.bs),
+                "epochs": int(self.learn.n_epoch),
+                "train_samples": len(self.dls.train_ds),
+                "valid_samples": len(self.dls.valid_ds),
+                "test_samples": len(self.test_loader.dataset) if self.test_loader else 0,
+                "model": "ResNet50UpProj"
+            })
+        except Exception as e:
+            print(f"Error in before_fit: {e}")
+            mlflow.log_param("error_before_fit", str(e))
+
+    def after_epoch(self):
+        try:
+            metrics = {}
+            if self.learn.recorder.losses:
+                metrics["train_loss"] = float(self.learn.recorder.losses[-1])
+            if self.learn.recorder.values and len(self.learn.recorder.values[-1]) >= 2:
+                metrics["valid_loss"] = float(self.learn.recorder.values[-1][1])
+                metric_names = ["mae", "rmse", "abs_rel", "log10_mae", "log10_rmse", "delta1", "delta2", "delta3"]
+                for i, name in enumerate(metric_names, start=2):
+                    if len(self.learn.recorder.values[-1]) > i:
+                        metrics[f"valid_{name}"] = float(self.learn.recorder.values[-1][i])
+            if metrics:
+                mlflow.log_metrics(metrics, step=self.epoch)
+        except Exception as e:
+            print(f"Error in after_epoch: {e}")
+            mlflow.log_param(f"error_epoch_{self.epoch}", str(e))
+
+    def after_fit(self):
+        try:
+            if self.log_model:
+                model_path = self.artifact_dir / "final_model.pth"
+                torch.save(self.learn.model.state_dict(), model_path)
+                mlflow.log_artifact(model_path, artifact_path="models")
+
+            if self.test_loader:
+                print("Evaluating on test set...")
+                test_metrics = self._compute_test_metrics()
+                if test_metrics:
+                    mlflow.log_metrics(test_metrics, step=self.learn.n_epoch)
+
+                xb, yb = next(iter(self.test_loader))
+                xb, yb = xb.to(self.device), yb.to(self.device)
+                with torch.no_grad():
+                    preds = self.learn.model(xb)
+                fig = visualize_depth_map((xb.cpu(), yb.cpu()), test=True, model=self.learn.model)
+                viz_path = self.artifact_dir / "test_preds_final.png"
+                fig.savefig(viz_path)
+                plt.close(fig)
+                mlflow.log_artifact(viz_path, artifact_path="visualizations")
+
+            if self.run:
+                mlflow.end_run()
+        except Exception as e:
+            print(f"Error in after_fit: {e}")
+            mlflow.log_param("error_after_fit", str(e))
+
+    def _compute_test_metrics(self):
+        try:
+            test_metrics = {}
+            all_preds = []
+            all_targets = []
+
+            self.learn.model.eval()
+            self.learn.model.to(self.device)
+            with torch.no_grad():
+                for xb, yb in tqdm(self.test_loader, total=len(self.test_loader), desc="Test Inference"):
+                    xb, yb = xb.to(self.device), yb.to(self.device)
+                    preds = self.learn.model(xb)
+                    all_preds.append(preds.cpu())
+                    all_targets.append(yb.cpu())
+
+            test_preds = torch.cat(all_preds)
+            test_targets = torch.cat(all_targets)
+
+            test_metrics["test_mae"] = float(torch.mean(torch.abs(test_preds - test_targets)).numpy())
+            test_metrics["test_rmse"] = float(torch.sqrt(torch.mean((test_preds - test_targets) ** 2)).numpy())
+            test_metrics["test_abs_rel"] = float(abs_rel(test_preds, test_targets).numpy())
+            test_metrics["test_log10_mae"] = float(log10_mae(test_preds, test_targets).numpy())
+            test_metrics["test_log10_rmse"] = float(log10_rmse(test_preds, test_targets).numpy())
+            test_metrics["test_delta1"] = float(delta1(test_preds, test_targets).numpy())
+            test_metrics["test_delta2"] = float(delta2(test_preds, test_targets).numpy())
+            test_metrics["test_delta3"] = float(delta3(test_preds, test_targets).numpy())
+            mlflow.log_params(test_metrics)
+
+            return test_metrics
+        except Exception as e:
+            print(f"Error computing test metrics: {e}")
+            mlflow.log_param("error_test_metrics", str(e))
+            return {}
+
+# Training
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 learn = Learner(
     dls,
     model,
     loss_func=loss_func,
     opt_func=Adam,
-    metrics=[mae, rmse],
-    cbs=[MLflowCallback()])
+    metrics=[mae, rmse, abs_rel, log10_mae, log10_rmse, delta1, delta2, delta3],
+    cbs=[MLflowCallback(log_model=True, test_loader=test_loader, run_name="SimpleDepthRun", device=device)]
+)
 
-learn.fit_one_cycle(5, 1e-4)
+learn.fit_one_cycle(1, 1e-4)
 
-def visualize_depth_map(samples, test=False, model=None):
-    input, target = samples
-    fig, ax = plt.subplots(6, 3, figsize=(18, 36))
-    for i in range(6):
-        ax[i, 0].imshow(input[i].permute(1, 2, 0).cpu().numpy())
-        ax[i, 0].set_title("Input RGB")
-        ax[i, 0].axis("off")
-
-        ax[i, 1].imshow(target[i].squeeze().cpu().numpy(), cmap="inferno")
-        ax[i, 1].set_title("Ground Truth")
-        ax[i, 1].axis("off")
-
-        if test and model:
-            with torch.no_grad():
-                pred = model(input.to(next(model.parameters()).device))
-                if pred.shape != target.shape:
-                    pred = torch.nn.functional.interpolate(
-                        pred, size=target.shape[-2:], mode='bilinear', align_corners=False
-                    )
-            ax[i, 2].imshow(pred[i].squeeze().cpu().numpy(), cmap="inferno")
-            ax[i, 2].set_title("Prediction")
-            ax[i, 2].axis("off")
-        else:
-            ax[i, 2].axis("off")
-
-    plt.tight_layout()
-    return fig
-
-# Log predictions
-xb, yb = dls.valid.one_batch()
-preds = learn.model(xb)
-fig = visualize_depth_map((xb.cpu(), yb.cpu()), test=True, model=learn.model)
-fig.savefig("fastai_sample_preds.png")
-mlflow.log_artifact("fastai_sample_preds.png")
-
-# Test data preparation
-print("Preparing test data...")
-valid_path = "val_extracted/val/indoors"
-filelist = []
-for root, dirs, files in os.walk(valid_path):
-    for file in files:
-        filelist.append(os.path.join(root, file))
-filelist.sort()
-data = {
-    "image": [x for x in filelist if x.endswith(".png")],
-    "depth": [x for x in filelist if x.endswith("_depth.npy")],
-    "mask": [x for x in filelist if x.endswith("_depth_mask.npy")],
-}
-test_df = pd.DataFrame(data)
-test_df = test_df.sample(frac=1, random_state=42)
-
-# Take subset of the training data for faster training
-test_df = test_df.sample(frac=0.1, random_state=42)
-test_dl = dblock.dataloaders(test_df, bs=32, num_workers=4)
-# evaluate the model on the test set
-learn.dls = test_dl
-learn.model.eval()
-learn.validate()
+# Print test metrics
+test_metrics = learn.cbs[-1]._compute_test_metrics()
+if test_metrics:
+    for metric_name, value in test_metrics.items():
+        print(f"{metric_name}: {value:.4f}")
