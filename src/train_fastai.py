@@ -8,20 +8,21 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-import mlflow
 from datetime import datetime
 from tqdm import tqdm
+import wandb
+from fastai.callback.wandb import WandbCallback
+from dotenv import load_dotenv
+
+load_dotenv()
+wandb.login(key=os.getenv("WANDB_API_KEY"))
+wandb.init(project="DepthEstimation", name="debug")
+
 
 # Assume these are defined
 from utils import visualize_depth_map
 from models import ResNet50UpProj
 from loss_fns import calculate_loss
-
-# Setup MLflow
-mlflow.set_tracking_uri("http://192.168.95.103:5000")
-mlflow.set_experiment("depth_prediction_experiment_fastai_mlflow")
-if mlflow.active_run():
-    mlflow.end_run()
 
 # Data preparation (training and validation)
 train_path = "train_extracted/train/indoors"
@@ -187,115 +188,6 @@ delta1 = threshold_accuracy(1.25)
 delta2 = threshold_accuracy(1.25 ** 2)
 delta3 = threshold_accuracy(1.25 ** 3)
 
-# MLflowCallback
-class MLflowCallback(Callback):
-    def __init__(self, log_model=True, test_loader=None, run_name=None, device='cuda'):
-        super().__init__()
-        self.log_model = log_model
-        self.test_loader = test_loader
-        self.run_name = run_name or f"DepthPrediction_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        self.artifact_dir = Path("mlflow_artifacts")
-        self.artifact_dir.mkdir(exist_ok=True)
-        self.run = None
-        self.device = device
-
-    def before_fit(self):
-        try:
-            if mlflow.active_run():
-                mlflow.end_run()
-            self.run = mlflow.start_run(run_name=self.run_name)
-            mlflow.log_params({
-                "lr": float(self.learn.opt.hypers[0]["lr"]),
-                "batch_size": int(self.dls.bs),
-                "epochs": int(self.learn.n_epoch),
-                "train_samples": len(self.dls.train_ds),
-                "valid_samples": len(self.dls.valid_ds),
-                "test_samples": len(self.test_loader.dataset) if self.test_loader else 0,
-                "model": "ResNet50UpProj"
-            })
-        except Exception as e:
-            print(f"Error in before_fit: {e}")
-            mlflow.log_param("error_before_fit", str(e))
-
-    def after_epoch(self):
-        try:
-            metrics = {}
-            if self.learn.recorder.losses:
-                metrics["train_loss"] = float(self.learn.recorder.losses[-1])
-            if self.learn.recorder.values and len(self.learn.recorder.values[-1]) >= 2:
-                metrics["valid_loss"] = float(self.learn.recorder.values[-1][1])
-                metric_names = ["mae", "rmse", "abs_rel", "log10_mae", "log10_rmse", "delta1", "delta2", "delta3"]
-                for i, name in enumerate(metric_names, start=2):
-                    if len(self.learn.recorder.values[-1]) > i:
-                        metrics[f"valid_{name}"] = float(self.learn.recorder.values[-1][i])
-            if metrics:
-                mlflow.log_metrics(metrics, step=self.epoch)
-        except Exception as e:
-            print(f"Error in after_epoch: {e}")
-            mlflow.log_param(f"error_epoch_{self.epoch}", str(e))
-
-    def after_fit(self):
-        try:
-            if self.log_model:
-                model_path = self.artifact_dir / "final_model.pth"
-                torch.save(self.learn.model.state_dict(), model_path)
-                mlflow.log_artifact(model_path, artifact_path="models")
-
-            if self.test_loader:
-                print("Evaluating on test set...")
-                test_metrics = self._compute_test_metrics()
-                if test_metrics:
-                    mlflow.log_metrics(test_metrics, step=self.learn.n_epoch)
-
-                xb, yb = next(iter(self.test_loader))
-                xb, yb = xb.to(self.device), yb.to(self.device)
-                with torch.no_grad():
-                    preds = self.learn.model(xb)
-                fig = visualize_depth_map((xb.cpu(), yb.cpu()), test=True, model=self.learn.model)
-                viz_path = self.artifact_dir / "test_preds_final.png"
-                fig.savefig(viz_path)
-                plt.close(fig)
-                mlflow.log_artifact(viz_path, artifact_path="visualizations")
-
-            if self.run:
-                mlflow.end_run()
-        except Exception as e:
-            print(f"Error in after_fit: {e}")
-            mlflow.log_param("error_after_fit", str(e))
-
-    def _compute_test_metrics(self):
-        try:
-            test_metrics = {}
-            all_preds = []
-            all_targets = []
-
-            self.learn.model.eval()
-            self.learn.model.to(self.device)
-            with torch.no_grad():
-                for xb, yb in tqdm(self.test_loader, total=len(self.test_loader), desc="Test Inference"):
-                    xb, yb = xb.to(self.device), yb.to(self.device)
-                    preds = self.learn.model(xb)
-                    all_preds.append(preds.cpu())
-                    all_targets.append(yb.cpu())
-
-            test_preds = torch.cat(all_preds)
-            test_targets = torch.cat(all_targets)
-
-            test_metrics["test_mae"] = float(torch.mean(torch.abs(test_preds - test_targets)).numpy())
-            test_metrics["test_rmse"] = float(torch.sqrt(torch.mean((test_preds - test_targets) ** 2)).numpy())
-            test_metrics["test_abs_rel"] = float(abs_rel(test_preds, test_targets).numpy())
-            test_metrics["test_log10_mae"] = float(log10_mae(test_preds, test_targets).numpy())
-            test_metrics["test_log10_rmse"] = float(log10_rmse(test_preds, test_targets).numpy())
-            test_metrics["test_delta1"] = float(delta1(test_preds, test_targets).numpy())
-            test_metrics["test_delta2"] = float(delta2(test_preds, test_targets).numpy())
-            test_metrics["test_delta3"] = float(delta3(test_preds, test_targets).numpy())
-            mlflow.log_params(test_metrics)
-
-            return test_metrics
-        except Exception as e:
-            print(f"Error computing test metrics: {e}")
-            mlflow.log_param("error_test_metrics", str(e))
-            return {}
 
 # Training
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -305,13 +197,66 @@ learn = Learner(
     loss_func=loss_func,
     opt_func=Adam,
     metrics=[mae, rmse, abs_rel, log10_mae, log10_rmse, delta1, delta2, delta3],
-    cbs=[MLflowCallback(log_model=True, test_loader=test_loader, run_name="SimpleDepthRun", device=device)]
+    cbs=[WandbCallback(), SaveModelCallback(monitor='valid_loss', fname='best_model')],
 )
 
-learn.fit_one_cycle(1, 1e-4)
+learn.fit_one_cycle(2, 1e-4)
+wandb.save('models/best_model.pth')
+learn.export('depth_estimation_model.pkl')
 
-# Print test metrics
-test_metrics = learn.cbs[-1]._compute_test_metrics()
-if test_metrics:
-    for metric_name, value in test_metrics.items():
-        print(f"{metric_name}: {value:.4f}")
+# test set inference
+import sys; sys.exit()
+test_path = "val_extracted/val/indoors"
+test_filelist = []
+for root, dirs, files in os.walk(test_path):
+    for file in files:
+        test_filelist.append(os.path.join(root, file))
+test_filelist.sort()
+test_data = {
+    "image": [x for x in test_filelist if x.endswith(".png")],
+    "depth": [x for x in test_filelist if x.endswith("_depth.npy")],
+    "mask": [x for x in test_filelist if x.endswith("_depth_mask.npy")],
+}
+test_df = pd.DataFrame(test_data)
+# Inference on test set
+predictions = []
+for img, _ in tqdm(test_loader, desc="Inference"):
+    img = img.to(device)
+    with torch.no_grad():
+        pred = learn.model(img)
+    pred = pred.cpu().numpy()
+    predictions.append(pred)
+predictions = np.concatenate(predictions, axis=0)
+# Convert predictions to torch tensor
+pred_tensor = torch.from_numpy(predictions)
+
+# Load ground truth depth maps
+gt_depths = []
+for i in range(len(test_df)):
+    depth = np.load(test_df.iloc[i]['depth']).squeeze()
+    mask = np.load(test_df.iloc[i]['mask']) > 0
+    epsilon = 1e-6
+    max_depth = min(300, np.percentile(depth[mask], 99))
+    depth = np.clip(depth, epsilon, max_depth)
+    depth_log = np.zeros_like(depth)
+    depth_log[mask] = np.log(depth[mask])
+    depth_log = np.clip(depth_log, np.log(epsilon), np.log(max_depth))
+    depth_log = cv2.resize(depth_log, (256, 256))
+    with np.errstate(invalid='ignore', divide='ignore'):
+        depth_norm = (depth_log / np.log(max_depth))
+        depth_norm = np.nan_to_num(depth_norm, nan=0.0, posinf=0.0, neginf=0.0)
+    gt_depths.append(depth_norm)
+
+# Efficient conversion to torch tensor
+gt_tensor = torch.from_numpy(np.array(gt_depths)).unsqueeze(1)
+
+# Compute and log metrics
+for metric in learn.metrics:
+    if callable(metric):
+        try:
+            metric_value = metric(pred_tensor, gt_tensor)
+            metric_name = getattr(metric, 'name', str(metric))
+            wandb.log({metric_name: metric_value})
+        except Exception as e:
+            print(f"Error calculating {metric}: {e}")
+

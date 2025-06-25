@@ -6,3 +6,5 @@ val_extracted/
 *.db
 mlruns/
 mlartifacts/
+wandb/
+*.pkl
