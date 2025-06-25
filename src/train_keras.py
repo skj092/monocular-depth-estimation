@@ -12,13 +12,14 @@ import pandas as pd
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
-import mlflow
-mlflow.set_tracking_uri("http://192.168.95.103:5000/")  # or use your custom tracking server
-mlflow.set_experiment("DepthEstimation-Keras")
-
-mlflow.tensorflow.autolog()
 
 keras.utils.set_random_seed(123)
+import mlflow
+
+mlflow.set_tracking_uri("http://192.168.95.103:5000")
+mlflow.set_experiment("depth_estimation_experiment_keras")
+
+mlflow.tensorflow.autolog()
 
 path = "val_extracted/val/indoors"
 
@@ -40,7 +41,7 @@ df = df.sample(frac=1, random_state=42)
 
 HEIGHT = 256
 WIDTH = 256
-LR = 0.0001
+LR = 0.00001
 EPOCHS = 30
 BATCH_SIZE = 32
 
@@ -122,42 +123,24 @@ class DataGenerator(keras.utils.PyDataset):
         return x, y
 
 
-def visualize_depth_map(samples, test=False, model=None, mlflow_log_path=None):
+def visualize_depth_map(samples, test=False, model=None):
     input, target = samples
     cmap = plt.cm.jet
     cmap.set_bad(color="black")
 
     if test:
         pred = model.predict(input)
-        fig, ax = plt.subplots(6, 3, figsize=(18, 36))
+        fig, ax = plt.subplots(6, 3, figsize=(50, 50))
         for i in range(6):
             ax[i, 0].imshow((input[i].squeeze()))
-            ax[i, 0].set_title("Input")
-
             ax[i, 1].imshow((target[i].squeeze()), cmap=cmap)
-            ax[i, 1].set_title("Ground Truth")
-
             ax[i, 2].imshow((pred[i].squeeze()), cmap=cmap)
-            ax[i, 2].set_title("Prediction")
+
     else:
-        fig, ax = plt.subplots(6, 2, figsize=(12, 36))
+        fig, ax = plt.subplots(6, 2, figsize=(50, 50))
         for i in range(6):
             ax[i, 0].imshow((input[i].squeeze()))
-            ax[i, 0].set_title("Input")
-
             ax[i, 1].imshow((target[i].squeeze()), cmap=cmap)
-            ax[i, 1].set_title("Ground Truth")
-
-    plt.tight_layout()
-
-    # Save and log to MLflow if path is provided
-    if mlflow_log_path:
-        save_path = os.path.join(mlflow_log_path, "depth_map_comparison.png")
-        fig.savefig(save_path)
-        plt.close(fig)
-        mlflow.log_artifact(save_path)
-    else:
-        plt.show()
 
 
 visualize_samples = next(
@@ -264,6 +247,43 @@ def image_gradients(image):
     return dy, dx
 
 
+class MAE(tf.keras.metrics.Metric):
+    def __init__(self, name='mae', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.total = self.add_weight(name='total', initializer='zeros')
+        self.count = self.add_weight(name='count', initializer='zeros')
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        value = tf.reduce_mean(tf.abs(y_true - y_pred))
+        self.total.assign_add(value)
+        self.count.assign_add(1.0)
+
+    def result(self):
+        return self.total / self.count
+
+    def reset_states(self):
+        self.total.assign(0.0)
+        self.count.assign(0.0)
+
+
+class RMSE(tf.keras.metrics.Metric):
+    def __init__(self, name='rmse', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.total = self.add_weight(name='total', initializer='zeros')
+        self.count = self.add_weight(name='count', initializer='zeros')
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        value = tf.reduce_mean(tf.square(y_true - y_pred))
+        self.total.assign_add(tf.sqrt(value))
+        self.count.assign_add(1.0)
+
+    def result(self):
+        return self.total / self.count
+
+    def reset_states(self):
+        self.total.assign(0.0)
+        self.count.assign(0.0)
+
 class DepthEstimationModel(keras.Model):
     def __init__(self):
         super().__init__()
@@ -271,6 +291,8 @@ class DepthEstimationModel(keras.Model):
         self.l1_loss_weight = 0.1
         self.edge_loss_weight = 0.9
         self.loss_metric = keras.metrics.Mean(name="loss")
+        self.mae_metric = MAE(name="mae")
+        self.rmse_metric = RMSE(name="rmse")
         f = [16, 32, 64, 128, 256]
         self.downscale_blocks = [
             DownscaleBlock(f[0]),
@@ -322,7 +344,7 @@ class DepthEstimationModel(keras.Model):
 
     @property
     def metrics(self):
-        return [self.loss_metric]
+        return [self.loss_metric, self.mae_metric, self.rmse_metric]
 
     def train_step(self, batch_data):
         input, target = batch_data
@@ -333,8 +355,12 @@ class DepthEstimationModel(keras.Model):
         gradients = tape.gradient(loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
         self.loss_metric.update_state(loss)
+        self.mae_metric.update_state(target, pred)
+        self.rmse_metric.update_state(target, pred)
         return {
             "loss": self.loss_metric.result(),
+            "mae": self.mae_metric.result(),
+            "rmse": self.rmse_metric.result(),
         }
 
     def test_step(self, batch_data):
@@ -344,8 +370,12 @@ class DepthEstimationModel(keras.Model):
         loss = self.calculate_loss(target, pred)
 
         self.loss_metric.update_state(loss)
+        self.mae_metric.update_state(target, pred)
+        self.rmse_metric.update_state(target, pred)
         return {
             "loss": self.loss_metric.result(),
+            "mae": self.mae_metric.result(),
+            "rmse": self.rmse_metric.result(),
         }
 
     def call(self, x):
@@ -377,30 +407,26 @@ train_loader = DataGenerator(
 validation_loader = DataGenerator(
     data=df[260:].reset_index(drop="true"), batch_size=BATCH_SIZE, dim=(HEIGHT, WIDTH)
 )
+model.fit(
+    train_loader,
+    epochs=EPOCHS,
+    validation_data=validation_loader,
+)
 
-with mlflow.start_run():
-    model.fit(
-        train_loader,
-        epochs=EPOCHS,
-        validation_data=validation_loader,
-    )
-
-    # Visualize and log output
-    os.makedirs("mlflow_outputs", exist_ok=True)
-    test_loader = next(
-        iter(
-            DataGenerator(
-                data=df[265:].reset_index(drop="true"), batch_size=6, dim=(HEIGHT, WIDTH)
-            )
+test_loader = next(
+    iter(
+        DataGenerator(
+            data=df[265:].reset_index(drop="true"), batch_size=6, dim=(HEIGHT, WIDTH)
         )
     )
-    visualize_depth_map(test_loader, test=True, model=model, mlflow_log_path="mlflow_outputs")
+)
+visualize_depth_map(test_loader, test=True, model=model)
 
-    test_loader = next(
-        iter(
-            DataGenerator(
-                data=df[300:].reset_index(drop="true"), batch_size=6, dim=(HEIGHT, WIDTH)
-            )
+test_loader = next(
+    iter(
+        DataGenerator(
+            data=df[300:].reset_index(drop="true"), batch_size=6, dim=(HEIGHT, WIDTH)
         )
     )
-
+)
+visualize_depth_map(test_loader, test=True, model=model)

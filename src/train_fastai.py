@@ -3,10 +3,10 @@ import pandas as pd
 import numpy as np
 import cv2
 import torch
-from sklearn.model_selection import train_test_split
 from fastai.callback.wandb import *
 import mlflow
 from fastai.callback.core import Callback
+from sklearn.model_selection import train_test_split
 
 import mlflow
 from fastai.callback.core import Callback
@@ -48,10 +48,10 @@ class MLflowCallback(Callback):
 
 
 # Create a DataFrame with image paths and corresponding depth and mask files
-path = "val_extracted/val/indoors"
+train_path = "train_extracted/train/indoors"
 
 filelist = []
-for root, dirs, files in os.walk(path):
+for root, dirs, files in os.walk(train_path):
     for file in files:
         filelist.append(os.path.join(root, file))
 
@@ -62,7 +62,8 @@ data = {
     "mask": [x for x in filelist if x.endswith("_depth_mask.npy")],
 }
 df = pd.DataFrame(data)
-df = df.sample(frac=1, random_state=42)
+df = df.sample(frac=0.1, random_state=42).reset_index(drop=True)
+print(f"Total samples: {len(df)}")
 train_df, valid_df = train_test_split(df, test_size=0.2, random_state=42)
 
 def open_image(fn):
@@ -75,15 +76,24 @@ def load_depth_masked(row):
     depth = np.load(row['depth']).squeeze()
     mask = np.load(row['mask']) > 0
 
-    max_depth = min(300, np.percentile(depth, 99))
-    depth = np.clip(depth, 0.1, max_depth)
-    depth = np.log(depth, where=mask)
-    depth = np.ma.masked_where(~mask, depth)
-    depth = np.clip(depth, 0.1, np.log(max_depth))
-    depth = cv2.resize(depth, (256, 256))
+    # Avoid 0s and negatives before log
+    epsilon = 1e-6  # small value to prevent log(0)
+    max_depth = min(300, np.percentile(depth[mask], 99))  # safer to mask before percentile
+    depth = np.clip(depth, epsilon, max_depth)
 
-    # Normalize to [0, 255] and convert to uint8
-    depth_norm = (depth / np.log(max_depth)) * 255
+    # Apply log only where masked
+    depth_log = np.zeros_like(depth)
+    depth_log[mask] = np.log(depth[mask])
+
+    # Normalize log depth to 0-255
+    depth_log = np.clip(depth_log, np.log(epsilon), np.log(max_depth))
+    depth_log = cv2.resize(depth_log, (256, 256))
+
+    # Normalize and handle potential NaNs/Infs
+    with np.errstate(invalid='ignore', divide='ignore'):
+        depth_norm = (depth_log / np.log(max_depth)) * 255
+        depth_norm = np.nan_to_num(depth_norm, nan=0.0, posinf=0.0, neginf=0.0)
+
     depth_uint8 = depth_norm.astype(np.uint8)
 
     return PILImageBW.create(depth_uint8)
@@ -98,7 +108,6 @@ dblock = DataBlock(
     splitter=IndexSplitter(valid_df.index),
     item_tfms=Resize((256, 256))
 )
-
 dls = dblock.dataloaders(pd.concat([train_df, valid_df]), bs=32, num_workers=4)
 
 class DepthWrapper(nn.Module):
@@ -317,7 +326,7 @@ learn = Learner(
     metrics=[mae, rmse],
     cbs=[MLflowCallback()])
 
-learn.fit_one_cycle(20, 1e-4)
+learn.fit_one_cycle(5, 1e-4)
 
 def visualize_depth_map(samples, test=False, model=None):
     input, target = samples
@@ -353,3 +362,27 @@ preds = learn.model(xb)
 fig = visualize_depth_map((xb.cpu(), yb.cpu()), test=True, model=learn.model)
 fig.savefig("fastai_sample_preds.png")
 mlflow.log_artifact("fastai_sample_preds.png")
+
+# Test data preparation
+print("Preparing test data...")
+valid_path = "val_extracted/val/indoors"
+filelist = []
+for root, dirs, files in os.walk(valid_path):
+    for file in files:
+        filelist.append(os.path.join(root, file))
+filelist.sort()
+data = {
+    "image": [x for x in filelist if x.endswith(".png")],
+    "depth": [x for x in filelist if x.endswith("_depth.npy")],
+    "mask": [x for x in filelist if x.endswith("_depth_mask.npy")],
+}
+test_df = pd.DataFrame(data)
+test_df = test_df.sample(frac=1, random_state=42)
+
+# Take subset of the training data for faster training
+test_df = test_df.sample(frac=0.1, random_state=42)
+test_dl = dblock.dataloaders(test_df, bs=32, num_workers=4)
+# evaluate the model on the test set
+learn.dls = test_dl
+learn.model.eval()
+learn.validate()
