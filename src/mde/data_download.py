@@ -16,6 +16,6 @@ def download_and_extract(dataset_name):
         print(f"{dataset_name} dataset already exists.")
 
 # Download 'val' and 'train' datasets
-# download_and_extract("val")
+download_and_extract("val")
 download_and_extract("train")
 
