@@ -11,8 +11,8 @@ from dotenv import load_dotenv
 from loss_fns import calculate_loss
 from model2 import DepthEstimationModel
 
-wandb.login(key=os.getenv("WANDB_API_KEY"))
-wandb.init(project="DepthEstimation", name="FastAI_Training",)
+# wandb.login(key=os.getenv("WANDB_API_KEY"))
+# wandb.init(project="DepthEstimation", name="FastAI_Training",)
 
 load_dotenv()
 
@@ -157,7 +157,7 @@ learn = Learner(
     loss_func=loss_func,
     opt_func=Adam,
     metrics=[mae, rmse, abs_rel, log10_mae, log10_rmse, delta1, delta2, delta3],
-    cbs=[WandbCallback(), SaveModelCallback(monitor='valid_loss', fname='best_model')],
+    # cbs=[WandbCallback(), SaveModelCallback(monitor='valid_loss', fname='best_model')],
 )
 
 learn.fit_one_cycle(15, 1e-4)
