@@ -1,379 +1,340 @@
-import os
-
-os.environ["KERAS_BACKEND"] = "tensorflow"
-
-import sys
-
-import tensorflow as tf
-import keras
-from keras import layers
-from keras import ops
 import pandas as pd
 import numpy as np
 import cv2
+import os
+import torch
+from sklearn.model_selection import train_test_split
+import wandb
+# from dotenv import load_dotenv
+from loss_fns import calculate_loss
+from model2 import DepthEstimationModel
+from fastai.vision.all import *
+import keras
+from torch.utils.data import DataLoader
+import torch.nn as nn
+from tqdm import tqdm
 import matplotlib.pyplot as plt
+from torchvision import transforms
 
-keras.utils.set_random_seed(123)
+# Data Download
+# annotation_folder = "/dataset/"
+# if not os.path.exists(os.path.abspath(".") + annotation_folder):
+#     annotation_zip = keras.utils.get_file(
+#         "val.tar.gz",
+#         cache_subdir=os.path.abspath("."),
+#         origin="http://diode-dataset.s3.amazonaws.com/val.tar.gz",
+#         extract=True,
+#     )
 
-path = "val_extracted/val/indoors"
+# wandb.login(key=os.getenv("WANDB_API_KEY"))
+# wandb.init(project="DepthEstimation", name="FastAI_Training",)
 
+# load_dotenv()
+
+
+# data loading and preprocessing
+train_path = "val_extracted/val/indoors"
 filelist = []
-
-for root, dirs, files in os.walk(path):
+for root, dirs, files in os.walk(train_path):
     for file in files:
         filelist.append(os.path.join(root, file))
 
 filelist.sort()
+
+images = sorted([x for x in filelist if x.endswith(".png")])
+depths = sorted([x for x in filelist if x.endswith("_depth.npy")])
+masks = sorted([x for x in filelist if x.endswith("_depth_mask.npy")])
+
+# Get base names
+depth_bases = {os.path.basename(x).replace("_depth.npy", "") for x in depths}
+mask_bases = {os.path.basename(x).replace("_depth_mask.npy", "") for x in masks}
+valid_bases = depth_bases & mask_bases
+
+# Filter valid files only
+valid_images = [x for x in images if os.path.basename(x).replace(".png", "") in valid_bases]
+valid_depths = [x for x in depths if os.path.basename(x).replace("_depth.npy", "") in valid_bases]
+valid_masks = [x for x in masks if os.path.basename(x).replace("_depth_mask.npy", "") in valid_bases]
+
+# Build DataFrame
 data = {
-    "image": [x for x in filelist if x.endswith(".png")],
-    "depth": [x for x in filelist if x.endswith("_depth.npy")],
-    "mask": [x for x in filelist if x.endswith("_depth_mask.npy")],
+    "image": valid_images,
+    "depth": valid_depths,
+    "mask": valid_masks,
 }
 df = pd.DataFrame(data)
+df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+print(f"Total train samples: {len(df)}")
+train_df, valid_df = train_test_split(df, test_size=0.2, random_state=42)
+print(f"Training samples: {len(train_df)}, Validation samples: {len(valid_df)}")
 
-df = df.sample(frac=1, random_state=42)
+# Dataset and DataLoader setup
+def open_image(fn):
+    img = cv2.imread(fn)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (256, 256))
+    return img
 
-HEIGHT = 256
-WIDTH = 256
-LR = 0.00001
-EPOCHS = 30
-BATCH_SIZE = 32
+def load_depth_masked(row):
+    depth = np.load(row['depth']).squeeze()
+    mask = np.load(row['mask']) > 0
+    epsilon = 1e-6
+    max_depth = min(300, np.percentile(depth[mask], 99))
+    depth = np.clip(depth, epsilon, max_depth)
+    depth_log = np.zeros_like(depth)
+    depth_log[mask] = np.log(depth[mask])
+    depth_log = np.clip(depth_log, np.log(epsilon), np.log(max_depth))
+    depth_log = cv2.resize(depth_log, (256, 256))
+    with np.errstate(invalid='ignore', divide='ignore'):
+        depth_norm = (depth_log / np.log(max_depth))
+        depth_norm = np.nan_to_num(depth_norm, nan=0.0, posinf=0.0, neginf=0.0)
+    depth_uint8 = (depth_norm * 255).astype(np.uint8)
+    return depth_uint8
 
-class DataGenerator(keras.utils.PyDataset):
-    def __init__(self, data, batch_size=6, dim=(768, 1024), n_channels=3, shuffle=True):
-        super().__init__()
-        """
-        Initialization
-        """
-        self.data = data
-        self.indices = self.data.index.tolist()
-        self.dim = dim
-        self.n_channels = n_channels
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.min_depth = 0.1
-        self.on_epoch_end()
+def get_x(row): return open_image(row['image'])
+def get_y(row): return load_depth_masked(row)
+
+class DepthDataset(torch.utils.data.Dataset):
+    def __init__(self, df):
+        self.df = df
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
     def __len__(self):
-        return int(np.ceil(len(self.data) / self.batch_size))
+        return len(self.df)
 
-    def __getitem__(self, index):
-        if (index + 1) * self.batch_size > len(self.indices):
-            self.batch_size = len(self.indices) - index * self.batch_size
-        # Generate one batch of data
-        # Generate indices of the batch
-        index = self.indices[index * self.batch_size : (index + 1) * self.batch_size]
-        # Find list of IDs
-        batch = [self.indices[k] for k in index]
-        x, y = self.data_generation(batch)
-
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        x = get_x(row)
+        y = get_y(row)
+        x = self.transform(x)
+        y = torch.tensor(y, dtype=torch.float32).unsqueeze(0) / 255.0
         return x, y
 
-    def on_epoch_end(self):
-        """
-        Updates indexes after each epoch
-        """
-        self.index = np.arange(len(self.indices))
-        if self.shuffle == True:
-            np.random.shuffle(self.index)
+train_ds = DepthDataset(train_df)
+a, b = train_ds[0]
+valid_ds = DepthDataset(valid_df)
+train_dl = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=4)
+valid_dl = DataLoader(valid_ds, batch_size=16, shuffle=False, num_workers=4)
+xb, yb = next(iter(train_dl))
+print(f"Batch shape: {xb.shape}, {yb.shape}")
 
-    def load(self, image_path, depth_map, mask):
-        """Load input and target image."""
-
-        image_ = cv2.imread(image_path)
-        image_ = cv2.cvtColor(image_, cv2.COLOR_BGR2RGB)
-        image_ = cv2.resize(image_, self.dim)
-        image_ = tf.image.convert_image_dtype(image_, tf.float32)
-
-        depth_map = np.load(depth_map).squeeze()
-
-        mask = np.load(mask)
-        mask = mask > 0
-
-        max_depth = min(300, np.percentile(depth_map, 99))
-        depth_map = np.clip(depth_map, self.min_depth, max_depth)
-        depth_map = np.log(depth_map, where=mask)
-
-        depth_map = np.ma.masked_where(~mask, depth_map)
-
-        depth_map = np.clip(depth_map, 0.1, np.log(max_depth))
-        depth_map = cv2.resize(depth_map, self.dim)
-        depth_map = np.expand_dims(depth_map, axis=2)
-        depth_map = tf.image.convert_image_dtype(depth_map, tf.float32)
-
-        return image_, depth_map
-
-    def data_generation(self, batch):
-        x = np.empty((self.batch_size, *self.dim, self.n_channels))
-        y = np.empty((self.batch_size, *self.dim, 1))
-
-        for i, batch_id in enumerate(batch):
-            x[i,], y[i,] = self.load(
-                self.data["image"][batch_id],
-                self.data["depth"][batch_id],
-                self.data["mask"][batch_id],
-            )
-        x, y = x.astype("float32"), y.astype("float32")
-        return x, y
-
-
-def visualize_depth_map(samples, test=False, model=None):
-    input, target = samples
-    cmap = plt.cm.jet
-    cmap.set_bad(color="black")
-
-    if test:
-        pred = model.predict(input)
-        fig, ax = plt.subplots(6, 3, figsize=(50, 50))
-        for i in range(6):
-            ax[i, 0].imshow((input[i].squeeze()))
-            ax[i, 1].imshow((target[i].squeeze()), cmap=cmap)
-            ax[i, 2].imshow((pred[i].squeeze()), cmap=cmap)
-
-    else:
-        fig, ax = plt.subplots(6, 2, figsize=(50, 50))
-        for i in range(6):
-            ax[i, 0].imshow((input[i].squeeze()))
-            ax[i, 1].imshow((target[i].squeeze()), cmap=cmap)
-
-
-visualize_samples = next(
-    iter(DataGenerator(data=df, batch_size=6, dim=(HEIGHT, WIDTH)))
-)
-visualize_depth_map(visualize_samples)
-
-class DownscaleBlock(layers.Layer):
-    def __init__(
-        self, filters, kernel_size=(3, 3), padding="same", strides=1, **kwargs
-    ):
-        super().__init__(**kwargs)
-        self.convA = layers.Conv2D(filters, kernel_size, strides, padding)
-        self.convB = layers.Conv2D(filters, kernel_size, strides, padding)
-        self.reluA = layers.LeakyReLU(negative_slope=0.2)
-        self.reluB = layers.LeakyReLU(negative_slope=0.2)
-        self.bn2a = layers.BatchNormalization()
-        self.bn2b = layers.BatchNormalization()
-
-        self.pool = layers.MaxPool2D((2, 2), (2, 2))
-
-    def call(self, input_tensor):
-        d = self.convA(input_tensor)
-        x = self.bn2a(d)
-        x = self.reluA(x)
-
-        x = self.convB(x)
-        x = self.bn2b(x)
-        x = self.reluB(x)
-
-        x += d
-        p = self.pool(x)
-        return x, p
-
-
-class UpscaleBlock(layers.Layer):
-    def __init__(
-        self, filters, kernel_size=(3, 3), padding="same", strides=1, **kwargs
-    ):
-        super().__init__(**kwargs)
-        self.us = layers.UpSampling2D((2, 2))
-        self.convA = layers.Conv2D(filters, kernel_size, strides, padding)
-        self.convB = layers.Conv2D(filters, kernel_size, strides, padding)
-        self.reluA = layers.LeakyReLU(negative_slope=0.2)
-        self.reluB = layers.LeakyReLU(negative_slope=0.2)
-        self.bn2a = layers.BatchNormalization()
-        self.bn2b = layers.BatchNormalization()
-        self.conc = layers.Concatenate()
-
-    def call(self, x, skip):
-        x = self.us(x)
-        concat = self.conc([x, skip])
-        x = self.convA(concat)
-        x = self.bn2a(x)
-        x = self.reluA(x)
-
-        x = self.convB(x)
-        x = self.bn2b(x)
-        x = self.reluB(x)
-
-        return x
-
-
-class BottleNeckBlock(layers.Layer):
-    def __init__(
-        self, filters, kernel_size=(3, 3), padding="same", strides=1, **kwargs
-    ):
-        super().__init__(**kwargs)
-        self.convA = layers.Conv2D(filters, kernel_size, strides, padding)
-        self.convB = layers.Conv2D(filters, kernel_size, strides, padding)
-        self.reluA = layers.LeakyReLU(negative_slope=0.2)
-        self.reluB = layers.LeakyReLU(negative_slope=0.2)
-
-    def call(self, x):
-        x = self.convA(x)
-        x = self.reluA(x)
-        x = self.convB(x)
-        x = self.reluB(x)
-        return x
-
-def image_gradients(image):
-    if len(ops.shape(image)) != 4:
-        raise ValueError(
-            "image_gradients expects a 4D tensor "
-            "[batch_size, h, w, d], not {}.".format(ops.shape(image))
-        )
-
-    image_shape = ops.shape(image)
-    batch_size, height, width, depth = ops.unstack(image_shape)
-
-    dy = image[:, 1:, :, :] - image[:, :-1, :, :]
-    dx = image[:, :, 1:, :] - image[:, :, :-1, :]
-
-    # Return tensors with same size as original image by concatenating
-    # zeros. Place the gradient [I(x+1,y) - I(x,y)] on the base pixel (x, y).
-    shape = ops.stack([batch_size, 1, width, depth])
-    dy = ops.concatenate([dy, ops.zeros(shape, dtype=image.dtype)], axis=1)
-    dy = ops.reshape(dy, image_shape)
-
-    shape = ops.stack([batch_size, height, 1, depth])
-    dx = ops.concatenate([dx, ops.zeros(shape, dtype=image.dtype)], axis=2)
-    dx = ops.reshape(dx, image_shape)
-
-    return dy, dx
-
-
-class DepthEstimationModel(keras.Model):
-    def __init__(self):
+# Model and loss function
+class DepthWrapper(nn.Module):
+    def __init__(self, base_model):
         super().__init__()
-        self.ssim_loss_weight = 0.85
-        self.l1_loss_weight = 0.1
-        self.edge_loss_weight = 0.9
-        self.loss_metric = keras.metrics.Mean(name="loss")
-        f = [16, 32, 64, 128, 256]
-        self.downscale_blocks = [
-            DownscaleBlock(f[0]),
-            DownscaleBlock(f[1]),
-            DownscaleBlock(f[2]),
-            DownscaleBlock(f[3]),
-        ]
-        self.bottle_neck_block = BottleNeckBlock(f[4])
-        self.upscale_blocks = [
-            UpscaleBlock(f[3]),
-            UpscaleBlock(f[2]),
-            UpscaleBlock(f[1]),
-            UpscaleBlock(f[0]),
-        ]
-        self.conv_layer = layers.Conv2D(1, (1, 1), padding="same", activation="tanh")
+        self.model = base_model
+    def forward(self, x):
+        out = self.model(x)
+        return F.interpolate(out, size=(256, 256), mode='bilinear', align_corners=False)
 
-    def calculate_loss(self, target, pred):
-        # Edges
-        dy_true, dx_true = image_gradients(target)
-        dy_pred, dx_pred = image_gradients(pred)
-        weights_x = ops.cast(ops.exp(ops.mean(ops.abs(dx_true))), "float32")
-        weights_y = ops.cast(ops.exp(ops.mean(ops.abs(dy_true))), "float32")
-
-        # Depth smoothness
-        smoothness_x = dx_pred * weights_x
-        smoothness_y = dy_pred * weights_y
-
-        depth_smoothness_loss = ops.mean(abs(smoothness_x)) + ops.mean(
-            abs(smoothness_y)
+class CombinedDepthLoss:
+    def __init__(self, ssim_loss_weight=1.0, l1_loss_weight=1.0, edge_loss_weight=1.0):
+        self.ssim_loss_weight = ssim_loss_weight
+        self.l1_loss_weight = l1_loss_weight
+        self.edge_loss_weight = edge_loss_weight
+    def __call__(self, pred, target):
+        return calculate_loss(
+            target,
+            pred,
+            ssim_loss_weight=self.ssim_loss_weight,
+            l1_loss_weight=self.l1_loss_weight,
+            edge_loss_weight=self.edge_loss_weight,
+            max_val=1.0
         )
 
-        # Structural similarity (SSIM) index
-        ssim_loss = ops.mean(
-            1
-            - tf.image.ssim(
-                target, pred, max_val=WIDTH, filter_size=7, k1=0.01**2, k2=0.03**2
-            )
-        )
-        # Point-wise depth
-        l1_loss = ops.mean(ops.abs(target - pred))
+loss_func = CombinedDepthLoss(ssim_loss_weight=1.0, l1_loss_weight=1.0, edge_loss_weight=1.0)
 
-        loss = (
-            (self.ssim_loss_weight * ssim_loss)
-            + (self.l1_loss_weight * l1_loss)
-            + (self.edge_loss_weight * depth_smoothness_loss)
-        )
+# Metrics
+def abs_rel(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = target > 1e-3  # Stricter threshold to avoid division by near-zero
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.mean(torch.abs(pred[mask] - target[mask]) / target[mask])
 
-        return loss
+def log10_mae(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = (target > 1e-3) & (pred > 1e-3)  # Mask non-positive values
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.mean(torch.abs(torch.log10(pred[mask]) - torch.log10(target[mask])))
 
-    @property
-    def metrics(self):
-        return [self.loss_metric]
+def log10_rmse(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = (target > 1e-3) & (pred > 1e-3)
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.sqrt(torch.mean((torch.log10(pred[mask]) - torch.log10(target[mask])) ** 2))
 
-    def train_step(self, batch_data):
-        input, target = batch_data
-        with tf.GradientTape() as tape:
-            pred = self(input, training=True)
-            loss = self.calculate_loss(target, pred)
+def threshold_accuracy(thresh):
+    def _inner(pred, target):
+        pred, target = pred.squeeze(), target.squeeze()
+        mask = target > 1e-3
+        if mask.sum() == 0:
+            return float('nan')
+        ratio = torch.max(pred[mask] / target[mask], target[mask] / pred[mask])
+        return torch.mean((ratio < thresh).float())
+    return _inner
 
-        gradients = tape.gradient(loss, self.trainable_variables)
-        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
-        self.loss_metric.update_state(loss)
-        return {
-            "loss": self.loss_metric.result(),
-        }
+delta1 = threshold_accuracy(1.25)
+delta2 = threshold_accuracy(1.25 ** 2)
+delta3 = threshold_accuracy(1.25 ** 3)
 
-    def test_step(self, batch_data):
-        input, target = batch_data
 
-        pred = self(input, training=False)
-        loss = self.calculate_loss(target, pred)
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model = DepthEstimationModel(in_channels=3)
+model = model.to(device)
 
-        self.loss_metric.update_state(loss)
-        return {
-            "loss": self.loss_metric.result(),
-        }
+# Optimizer and scheduler
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+# scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, steps_per_epoch=len(train_dl), epochs=10)
+# Training loop
 
-    def call(self, x):
-        c1, p1 = self.downscale_blocks[0](x)
-        c2, p2 = self.downscale_blocks[1](p1)
-        c3, p3 = self.downscale_blocks[2](p2)
-        c4, p4 = self.downscale_blocks[3](p3)
+def train_epoch(model, train_dl, optimizer, loss_func, device):
+    model.train()
+    total_loss = 0.0
+    for x, y in tqdm(train_dl):
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        pred = model(x)
+        loss = loss_func(pred, y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(train_dl)
+def validate_epoch(model, valid_dl, loss_func, device):
+    model.eval()
+    total_loss = 0.0
+    metrics = {
+        'abs_rel': 0.0,
+        'log10_mae': 0.0,
+        'log10_rmse': 0.0,
+        'delta1': 0.0,
+        'delta2': 0.0,
+        'delta3': 0.0
+    }
+    with torch.no_grad():
+        for x, y in tqdm(valid_dl):
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            loss = loss_func(pred, y)
+            total_loss += loss.item()
+            metrics = {}
+            # metrics['abs_rel'] += abs_rel(pred, y).item()
+            # metrics['log10_mae'] += log10_mae(pred, y).item()
+            # metrics['log10_rmse'] += log10_rmse(pred, y).item()
+            # metrics['delta1'] += delta1(pred, y).item()
+            # metrics['delta2'] += delta2(pred, y).item()
+            # metrics['delta3'] += delta3(pred, y).item()
+    num_batches = len(valid_dl)
+    return (total_loss / num_batches, {k: v / num_batches for k, v in metrics.items()})
 
-        bn = self.bottle_neck_block(p4)
+def train_model(model, train_dl, valid_dl, optimizer, loss_func, device, epochs=10):
+    for epoch in range(epochs):
+        train_loss = train_epoch(model, train_dl, optimizer, loss_func, device)
+        valid_loss, metrics = validate_epoch(model, valid_dl, loss_func, device)
 
-        u1 = self.upscale_blocks[0](bn, c4)
-        u2 = self.upscale_blocks[1](u1, c3)
-        u3 = self.upscale_blocks[2](u2, c2)
-        u4 = self.upscale_blocks[3](u3, c1)
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Valid Loss: {valid_loss:.4f}")
+        print(f"Metrics: {metrics}")
 
-        return self.conv_layer(u4)
+        # Update learning rate
+        # scheduler.step()
+        # Log to Weights & Biases
+        # wandb.log({
+        #     'epoch': epoch + 1,
+        #     'train_loss': train_loss,
+        #     'valid_loss': valid_loss,
+        #     **metrics
+        # })
+    return model
 
-optimizer = keras.optimizers.SGD(
-    learning_rate=LR,
-    nesterov=False,
-)
-model = DepthEstimationModel()
-# Compile the model
-model.compile(optimizer)
 
-train_loader = DataGenerator(
-    data=df[:260].reset_index(drop="true"), batch_size=BATCH_SIZE, dim=(HEIGHT, WIDTH)
-)
-validation_loader = DataGenerator(
-    data=df[260:].reset_index(drop="true"), batch_size=BATCH_SIZE, dim=(HEIGHT, WIDTH)
-)
-model.fit(
-    train_loader,
-    epochs=EPOCHS,
-    validation_data=validation_loader,
-)
+# visualize a batch of data
+import matplotlib.pyplot as plt
+import numpy as np
 
-test_loader = next(
-    iter(
-        DataGenerator(
-            data=df[265:].reset_index(drop="true"), batch_size=6, dim=(HEIGHT, WIDTH)
-        )
-    )
-)
-visualize_depth_map(test_loader, test=True, model=model)
+def visualize_batch(dl, pairs_per_row=2):
+    for x, y in dl:
+        x = x.permute(0, 2, 3, 1).numpy()  # [B, H, W, C]
+        y = y.squeeze(1).numpy()           # [B, H, W]
 
-test_loader = next(
-    iter(
-        DataGenerator(
-            data=df[300:].reset_index(drop="true"), batch_size=6, dim=(HEIGHT, WIDTH)
-        )
-    )
-)
-visualize_depth_map(test_loader, test=True, model=model)
+        # Unnormalize input images (assuming ImageNet stats)
+        imagenet_mean = np.array([0.485, 0.456, 0.406])
+        imagenet_std = np.array([0.229, 0.224, 0.225])
+        x = x * imagenet_std + imagenet_mean
+        x = np.clip(x, 0, 1)
+
+        batch_size = x.shape[0]
+        num_cols = pairs_per_row
+        num_rows = int(np.ceil(batch_size / num_cols))
+
+        fig, axes = plt.subplots(nrows=num_rows * 2, ncols=num_cols, figsize=(5 * num_cols, 4 * num_rows))
+
+        for i in range(batch_size):
+            row = (i // num_cols) * 2
+            col = i % num_cols
+
+            axes[row, col].imshow(x[i])
+            axes[row, col].set_title(f'Input {i}')
+            axes[row, col].axis('off')
+
+            axes[row + 1, col].imshow(y[i], cmap='viridis')
+            axes[row + 1, col].set_title(f'Depth {i}')
+            axes[row + 1, col].axis('off')
+
+        # Hide any empty subplots
+        for i in range(batch_size, num_rows * num_cols):
+            row = (i // num_cols) * 2
+            col = i % num_cols
+            axes[row, col].axis('off')
+            axes[row + 1, col].axis('off')
+
+        plt.tight_layout()
+        plt.savefig('batch_visualization.png')
+        plt.show()
+        break  # only show one batch
+
+visualize_batch(train_dl)
+import sys; sys.exit()
+
+model = train_model(model, train_dl, valid_dl, optimizer, loss_func, device, epochs=10)
+# Save the model
+torch.save(model.state_dict(), 'depth_estimation_model.pth')
+
+import matplotlib.pyplot as plt
+
+def visualize_predictions(model, valid_dl, device):
+    model.eval()
+    with torch.no_grad():
+        for i, (x, y) in enumerate(valid_dl):
+            x = x.to(device)
+            pred = model(x)
+            pred = F.interpolate(pred, size=(256, 256), mode='bilinear', align_corners=False)
+
+            # Get only the first image from the batch
+            pred_img = pred[0].cpu().squeeze().numpy()
+            y_img = y[0].cpu().squeeze().numpy()
+
+            # Convert to uint8 for visualization
+            pred_vis = (pred_img * 255).astype(np.uint8)
+            y_vis = (y_img * 255).astype(np.uint8)
+
+            # Plot side-by-side
+            fig, axs = plt.subplots(1, 2, figsize=(10, 4))
+            axs[0].imshow(pred_vis, cmap='gray')
+            axs[0].set_title(f'Predicted Depth {i}')
+            axs[0].axis('off')
+
+            axs[1].imshow(y_vis, cmap='gray')
+            axs[1].set_title(f'Ground Truth Depth {i}')
+            axs[1].axis('off')
+
+            plt.tight_layout()
+            plt.show()
+
+            if i >= 4:  # Show only 5 batches
+                break
+
+visualize_predictions(model, valid_dl, device)

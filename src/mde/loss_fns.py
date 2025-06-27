@@ -47,6 +47,58 @@ def calculate_loss(target, pred, ssim_loss_weight=1.0, l1_loss_weight=1.0, edge_
     )
     return loss
 
+
+def abs_rel(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = target > 1e-3  # Stricter threshold to avoid division by near-zero
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.mean(torch.abs(pred[mask] - target[mask]) / target[mask])
+
+def log10_mae(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = (target > 1e-3) & (pred > 1e-3)  # Mask non-positive values
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.mean(torch.abs(torch.log10(pred[mask]) - torch.log10(target[mask])))
+
+def log10_rmse(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = (target > 1e-3) & (pred > 1e-3)
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.sqrt(torch.mean((torch.log10(pred[mask]) - torch.log10(target[mask])) ** 2))
+
+def threshold_accuracy(thresh):
+    def _inner(pred, target):
+        pred, target = pred.squeeze(), target.squeeze()
+        mask = target > 1e-3
+        if mask.sum() == 0:
+            return float('nan')
+        ratio = torch.max(pred[mask] / target[mask], target[mask] / pred[mask])
+        return torch.mean((ratio < thresh).float())
+    return _inner
+
+delta1 = threshold_accuracy(1.25)
+delta2 = threshold_accuracy(1.25 ** 2)
+delta3 = threshold_accuracy(1.25 ** 3)
+
+class CombinedDepthLoss:
+    def __init__(self, ssim_loss_weight=1.0, l1_loss_weight=1.0, edge_loss_weight=1.0):
+        self.ssim_loss_weight = ssim_loss_weight
+        self.l1_loss_weight = l1_loss_weight
+        self.edge_loss_weight = edge_loss_weight
+    def __call__(self, pred, target):
+        return calculate_loss(
+            target,
+            pred,
+            ssim_loss_weight=self.ssim_loss_weight,
+            l1_loss_weight=self.l1_loss_weight,
+            edge_loss_weight=self.edge_loss_weight,
+            max_val=1.0
+        )
+
+
 if __name__ == "__main__":
     # Example usage
     target = torch.rand(1, 3, 256, 256)  # Random target image

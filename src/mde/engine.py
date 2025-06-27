@@ -3,83 +3,43 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+# from loss_fns import calculate_loss, abs_rel, log10_mae, log10_rmse, delta1, delta2, delta3
 
 
-def train_depth_model(
-    model,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    epochs: int = 10,
-    lr: float = 1e-4,
-    save_path: str = "resnet_uproj_depth.pt",
-    device: torch.device = None,
-):
-    """
-    Train a depth estimation model using MSE loss.
-
-    Args:
-        model: PyTorch model (e.g., ResNet50UpProj)
-        train_loader: DataLoader for training data
-        val_loader: DataLoader for validation data
-        epochs: Number of training epochs
-        lr: Learning rate
-        save_path: Path to save the best model
-        device: torch.device object, defaults to GPU if available
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = model.to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    best_val_loss = float("inf")
-
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0.0
-
-        for images, depths in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} - Training"):
-            images = images.to(device)
-            depths = depths.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(images)
-
-            # Resize output to match target depth dimensions
-            if outputs.shape != depths.shape:
-                outputs = torch.nn.functional.interpolate(outputs, size=depths.shape[-2:], mode='bilinear', align_corners=False)
-
-            loss = criterion(outputs, depths)
-            loss.backward()
-            optimizer.step()
-
-            train_loss += loss.item() * images.size(0)
-
-        train_loss /= len(train_loader.dataset)
-
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for images, depths in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} - Validation"):
-                images = images.to(device)
-                depths = depths.to(device)
-
-                outputs = model(images)
-                if outputs.shape != depths.shape:
-                    outputs = torch.nn.functional.interpolate(outputs, size=depths.shape[-2:], mode='bilinear', align_corners=False)
-
-                loss = criterion(outputs, depths)
-                val_loss += loss.item() * images.size(0)
-
-        val_loss /= len(val_loader.dataset)
-
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), save_path)
-            print(f"✅ Model saved to {save_path} (best val loss: {best_val_loss:.4f})")
-
+def train_epoch(model, train_dl, optimizer, loss_func, device):
+    model.train()
+    total_loss = 0.0
+    for x, y in tqdm(train_dl):
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        pred = model(x)
+        loss = loss_func(pred, y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(train_dl)
+def validate_epoch(model, valid_dl, loss_func, device):
+    model.eval()
+    total_loss = 0.0
+    metrics = {
+        'abs_rel': 0.0,
+        'log10_mae': 0.0,
+        'log10_rmse': 0.0,
+        'delta1': 0.0,
+        'delta2': 0.0,
+        'delta3': 0.0
+    }
+    with torch.no_grad():
+        for x, y in tqdm(valid_dl):
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            loss = loss_func(pred, y)
+            total_loss += loss.item()
+            metrics['abs_rel'] += abs_rel(pred, y).item()
+            metrics['log10_mae'] += log10_mae(pred, y).item()
+            metrics['log10_rmse'] += log10_rmse(pred, y).item()
+            metrics['delta1'] += delta1(pred, y).item()
+            metrics['delta2'] += delta2(pred, y).item()
+            metrics['delta3'] += delta3(pred, y).item()
+    num_batches = len(valid_dl)
+    return (total_loss / num_batches, {k: v / num_batches for k, v in metrics.items()})
