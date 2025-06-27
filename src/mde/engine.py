@@ -1,9 +1,38 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
 from tqdm import tqdm
-from torch.utils.data import DataLoader
-# from loss_fns import calculate_loss, abs_rel, log10_mae, log10_rmse, delta1, delta2, delta3
+
+def abs_rel(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = target > 1e-3  # Stricter threshold to avoid division by near-zero
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.mean(torch.abs(pred[mask] - target[mask]) / target[mask])
+
+def log10_mae(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = (target > 1e-3) & (pred > 1e-3)  # Mask non-positive values
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.mean(torch.abs(torch.log10(pred[mask]) - torch.log10(target[mask])))
+
+def log10_rmse(pred, target):
+    pred, target = pred.squeeze(), target.squeeze()
+    mask = (target > 1e-3) & (pred > 1e-3)
+    if mask.sum() == 0:
+        return float('nan')
+    return torch.sqrt(torch.mean((torch.log10(pred[mask]) - torch.log10(target[mask])) ** 2))
+
+def threshold_accuracy(thresh):
+    def _inner(pred, target):
+        pred, target = pred.squeeze(), target.squeeze()
+        mask = target > 1e-3
+        if mask.sum() == 0:
+            return float('nan')
+        ratio = torch.max(pred[mask] / target[mask], target[mask] / pred[mask])
+        return torch.mean((ratio < thresh).float())
+    return _inner
+
+
 
 
 def train_epoch(model, train_dl, optimizer, loss_func, device):
@@ -19,6 +48,9 @@ def train_epoch(model, train_dl, optimizer, loss_func, device):
         total_loss += loss.item()
     return total_loss / len(train_dl)
 def validate_epoch(model, valid_dl, loss_func, device):
+    delta1 = threshold_accuracy(1.25)
+    delta2 = threshold_accuracy(1.25 ** 2)
+    delta3 = threshold_accuracy(1.25 ** 3)
     model.eval()
     total_loss = 0.0
     metrics = {
@@ -35,9 +67,9 @@ def validate_epoch(model, valid_dl, loss_func, device):
             pred = model(x)
             loss = loss_func(pred, y)
             total_loss += loss.item()
-            metrics['abs_rel'] += abs_rel(pred, y).item()
-            metrics['log10_mae'] += log10_mae(pred, y).item()
-            metrics['log10_rmse'] += log10_rmse(pred, y).item()
+            metrics['abs_rel'] += abs_rel(pred, y)
+            metrics['log10_mae'] += log10_mae(pred, y)
+            metrics['log10_rmse'] += log10_rmse(pred, y)
             metrics['delta1'] += delta1(pred, y).item()
             metrics['delta2'] += delta2(pred, y).item()
             metrics['delta3'] += delta3(pred, y).item()
