@@ -9,7 +9,7 @@ import wandb
 from fastai.callback.wandb import WandbCallback
 from dotenv import load_dotenv
 from loss_fns import calculate_loss
-from models import DepthEstimationModel
+from model2 import DepthEstimationModel
 
 wandb.login(key=os.getenv("WANDB_API_KEY"))
 wandb.init(project="DepthEstimation", name="FastAI_Training",)
