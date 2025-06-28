@@ -4,12 +4,16 @@ import torch.optim as optim
 from tqdm import tqdm
 import mlflow
 
-def train(model, train_loader, epochs, learning_rate, device, mlflow_log_prefix=None):
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+
+def train(model, train_loader, valid_loader=None, epochs=10, learning_rate=0.001, device="cpu", mlflow_log_prefix=None):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    model.train()
     for epoch in range(epochs):
+        model.train()
         running_loss = 0.0
         for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", unit="batch"):
             inputs, labels = inputs.to(device), labels.to(device)
@@ -22,11 +26,36 @@ def train(model, train_loader, epochs, learning_rate, device, mlflow_log_prefix=
 
             running_loss += loss.item()
 
-        avg_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+        avg_train_loss = running_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}")
 
         if mlflow_log_prefix:
-            mlflow.log_metric(f"{mlflow_log_prefix}_train_loss", avg_loss, step=epoch+1)
+            mlflow.log_metric(f"{mlflow_log_prefix}_train_loss", avg_train_loss, step=epoch+1)
+
+        # Validation evaluation
+        if valid_loader is not None:
+            model.eval()
+            val_loss = 0.0
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for val_inputs, val_labels in valid_loader:
+                    val_inputs, val_labels = val_inputs.to(device), val_labels.to(device)
+                    outputs = model(val_inputs)
+                    loss = criterion(outputs, val_labels)
+                    val_loss += loss.item()
+
+                    _, predicted = torch.max(outputs, 1)
+                    correct += (predicted == val_labels).sum().item()
+                    total += val_labels.size(0)
+
+            avg_val_loss = val_loss / len(valid_loader)
+            val_acc = correct / total
+            print(f"Epoch {epoch+1}/{epochs}, Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.4f}")
+
+            if mlflow_log_prefix:
+                mlflow.log_metric(f"{mlflow_log_prefix}_val_loss", avg_val_loss, step=epoch+1)
+                mlflow.log_metric(f"{mlflow_log_prefix}_val_acc", val_acc, step=epoch+1)
 
 def test(model, test_loader, device, mlflow_log_prefix=None, epoch=None):
     model.to(device)
@@ -51,14 +80,31 @@ def test(model, test_loader, device, mlflow_log_prefix=None, epoch=None):
 
     return accuracy
 
-def train_knowledge_distillation(teacher, student, train_loader, epochs, learning_rate, T, soft_target_loss_weight, ce_loss_weight, device, mlflow_log_prefix=None, test_loader=None):
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+
+def train_knowledge_distillation(
+    teacher,
+    student,
+    train_loader,
+    epochs,
+    learning_rate,
+    T,
+    soft_target_loss_weight,
+    ce_loss_weight,
+    device,
+    mlflow_log_prefix=None,
+    test_loader=None,
+    valid_loader=None  # ← added
+):
     ce_loss = nn.CrossEntropyLoss()
     optimizer = optim.Adam(student.parameters(), lr=learning_rate)
 
     teacher.eval()
-    student.train()
 
     for epoch in range(epochs):
+        student.train()
         running_loss = 0.0
         for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", unit="batch"):
             inputs, labels = inputs.to(device), labels.to(device)
@@ -72,7 +118,7 @@ def train_knowledge_distillation(teacher, student, train_loader, epochs, learnin
 
             soft_targets = nn.functional.softmax(teacher_logits / T, dim=-1)
             soft_prob = nn.functional.log_softmax(student_logits / T, dim=-1)
-            soft_targets_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob)) / soft_prob.size()[0] * (T**2)
+            soft_targets_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob)) / soft_prob.size(0) * (T**2)
             label_loss = ce_loss(student_logits, labels)
             loss = soft_target_loss_weight * soft_targets_loss + ce_loss_weight * label_loss
 
@@ -82,11 +128,37 @@ def train_knowledge_distillation(teacher, student, train_loader, epochs, learnin
             running_loss += loss.item()
 
         avg_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_loss:.4f}")
 
         if mlflow_log_prefix:
             mlflow.log_metric(f"{mlflow_log_prefix}_train_loss", avg_loss, step=epoch+1)
 
+        # Validation evaluation
+        if valid_loader is not None:
+            student.eval()
+            val_loss = 0.0
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for val_inputs, val_labels in valid_loader:
+                    val_inputs, val_labels = val_inputs.to(device), val_labels.to(device)
+                    outputs = student(val_inputs)
+                    loss = ce_loss(outputs, val_labels)
+                    val_loss += loss.item()
+
+                    _, predicted = torch.max(outputs, 1)
+                    correct += (predicted == val_labels).sum().item()
+                    total += val_labels.size(0)
+
+            avg_val_loss = val_loss / len(valid_loader)
+            val_acc = correct / total
+            print(f"Epoch {epoch+1}/{epochs}, Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.4f}")
+
+            if mlflow_log_prefix:
+                mlflow.log_metric(f"{mlflow_log_prefix}_val_loss", avg_val_loss, step=epoch+1)
+                mlflow.log_metric(f"{mlflow_log_prefix}_val_acc", val_acc, step=epoch+1)
+
+        # Optional test set evaluation each epoch
         if test_loader is not None:
             acc = test(student, test_loader, device, mlflow_log_prefix=mlflow_log_prefix, epoch=epoch)
 
